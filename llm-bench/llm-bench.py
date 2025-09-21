@@ -57,14 +57,20 @@ class MaxTokensBenchmark:
             if self.platform == "ollama":
                 response_text = result.get('response', '')
             else:  # openai/vllm
+                response_text = ''
                 if 'choices' in result and len(result['choices']) > 0:
                     choice = result['choices'][0]
-                    if 'message' in choice:
-                        response_text = choice['message'].get('content', '')
-                    else:
-                        response_text = choice.get('text', '')
-                else:
-                    response_text = ''
+                    if 'message' in choice and choice['message'] is not None:
+                        message = choice['message']
+                        # Try different content fields
+                        response_text = (
+                            message.get('content', '') or 
+                            message.get('reasoning_content', '') or 
+                            message.get('text', '') or 
+                            ''
+                        )
+                    elif 'text' in choice and choice['text'] is not None:
+                        response_text = choice.get('text', '') or ''
             
             # Calculate metrics
             latency = end_time - start_time

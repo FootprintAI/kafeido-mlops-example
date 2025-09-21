@@ -204,8 +204,8 @@ run_single_request() {
         thinking_text=$(echo "$response_body" | jq -r '.thinking // empty')
         content_source="response"
     else
-        # OpenAI/vLLM format
-        response_text=$(echo "$response_body" | jq -r '.choices[0].message.content // .choices[0].text // empty')
+        # OpenAI/vLLM format - try multiple content fields
+        response_text=$(echo "$response_body" | jq -r '.choices[0].message.content // .choices[0].message.reasoning_content // .choices[0].text // empty')
         content_source="choices"
     fi
     
@@ -295,7 +295,7 @@ get_response_text() {
     if [ "$PLATFORM" = "ollama" ]; then
         response_text=$(echo "$response" | jq -r '.response // empty')
     else
-        response_text=$(echo "$response" | jq -r '.choices[0].message.content // .choices[0].text // empty')
+        response_text=$(echo "$response" | jq -r '.choices[0].message.content // .choices[0].message.reasoning_content // .choices[0].text // empty')
     fi
     
     # Only return actual response content, not thinking
