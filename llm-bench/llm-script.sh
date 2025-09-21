@@ -1,23 +1,44 @@
 #!/bin/bash
 
-# Quick Maximum Tokens/Second Test for GPT-OSS 20B
+# Quick Maximum Tokens/Second Test for Multiple LLM Platforms
 # This script runs a fast test to find peak tokens/second performance
+# Supports: Ollama, vLLM/OpenAI-compatible APIs
 #
 # Usage:
-#   ./llm-script.sh                              # Normal run (3 rounds each test)
+#   ./llm-script.sh                              # Normal run (Ollama, 3 rounds each test)
+#   PLATFORM=vllm ./llm-script.sh                # Use vLLM/OpenAI API
+#   PLATFORM=ollama MODEL=llama2 ./llm-script.sh # Use different model on Ollama
 #   DEBUG=true ./llm-script.sh                   # Debug mode with full request/response details
 #   VERBOSE=true ./llm-script.sh                 # Show request/response for all tests
 #   ROUNDS=5 ./llm-script.sh                     # Run 5 rounds per test
 #   WARMUP_ROUNDS=2 ROUNDS=5 ./llm-script.sh     # 2 warmup + 5 measured rounds
 #   PREDICT_TOKENS=800 CONTEXT_SIZE=16384 ./llm-script.sh  # Larger limits for complex prompts
 #   MAX_RETRIES=3 REQUEST_TIMEOUT=180 ./llm-script.sh       # More retries, longer timeout
+#   HOST=localhost PORT=8000 PLATFORM=vllm ./llm-script.sh  # Custom host/port
 #
 # Requirements:
 #   - curl, jq, bc utilities
-#   - Running Ollama instance with gpt-oss:20b model
+#   - Running LLM server (Ollama or vLLM)
 
-MODEL="gpt-oss:20b"
-HOST="localhost:11434"
+# Platform-specific defaults
+PLATFORM=${PLATFORM:-ollama}
+if [ "$PLATFORM" = "ollama" ]; then
+    MODEL=${MODEL:-"gpt-oss:20b"}
+    HOST=${HOST:-"localhost"}
+    PORT=${PORT:-11434}
+    API_PATH="/api/generate"
+elif [ "$PLATFORM" = "vllm" ] || [ "$PLATFORM" = "openai" ]; then
+    MODEL=${MODEL:-"gpt-3.5-turbo"}
+    HOST=${HOST:-"localhost"}
+    PORT=${PORT:-8000}
+    API_PATH="/v1/chat/completions"
+else
+    echo "❌ Unsupported platform: $PLATFORM"
+    echo "Supported platforms: ollama, vllm, openai"
+    exit 1
+fi
+
+ENDPOINT="$HOST:$PORT"
 MAX_TOKENS_PER_SECOND=0
 BEST_RUN=""
 DEBUG=${DEBUG:-false}
@@ -31,7 +52,8 @@ PREDICT_TOKENS=${PREDICT_TOKENS:-600}
 
 echo "🎯 Quick Maximum Tokens/Second Test for $MODEL"
 echo "=============================================="
-echo "Host: $HOST"
+echo "Platform: ${PLATFORM^^}"
+echo "Host: $ENDPOINT"
 echo "Rounds per test: $ROUNDS (+ $WARMUP_ROUNDS warmup)"
 echo "Config: ${PREDICT_TOKENS} tokens, ${CONTEXT_SIZE} context, ${REQUEST_TIMEOUT}s timeout, ${MAX_RETRIES} retries"
 echo "Started: $(date)"
@@ -39,9 +61,16 @@ echo ""
 
 # Test connection and model availability
 echo "🔍 Testing connection and model availability..."
-test_response=$(curl -s --max-time 10 -w "%{http_code}" http://$HOST/api/generate \
+
+if [ "$PLATFORM" = "ollama" ]; then
+    test_payload="{\"model\": \"$MODEL\", \"prompt\": \"Test\", \"stream\": false, \"options\": {\"num_predict\": 1}}"
+else
+    test_payload="{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Test\"}], \"max_tokens\": 1, \"stream\": false}"
+fi
+
+test_response=$(curl -s --max-time 10 -w "%{http_code}" http://$ENDPOINT$API_PATH \
     -H "Content-Type: application/json" \
-    -d "{\"model\": \"$MODEL\", \"prompt\": \"Test\", \"stream\": false, \"options\": {\"num_predict\": 1}}")
+    -d "$test_payload")
 
 test_http_code="${test_response: -3}"
 test_response_body="${test_response%???}"
@@ -50,9 +79,14 @@ if [ "$test_http_code" != "200" ]; then
     echo "❌ Connection failed. HTTP status: $test_http_code"
     echo "Response: $test_response_body"
     echo "Please check:"
-    echo "  - Ollama is running (ollama serve)"
-    echo "  - Model is available (ollama list)"
-    echo "  - Host/port is correct: $HOST"
+    if [ "$PLATFORM" = "ollama" ]; then
+        echo "  - Ollama is running (ollama serve)"
+        echo "  - Model is available (ollama list)"
+    else
+        echo "  - vLLM server is running"
+        echo "  - Model is loaded and available"
+    fi
+    echo "  - Host/port is correct: $ENDPOINT"
     exit 1
 fi
 
@@ -60,12 +94,16 @@ test_error=$(echo "$test_response_body" | jq -r '.error // empty')
 if [ ! -z "$test_error" ]; then
     echo "❌ Model error: $test_error"
     echo "Please check:"
-    echo "  - Model '$MODEL' is installed (ollama pull $MODEL)"
+    if [ "$PLATFORM" = "ollama" ]; then
+        echo "  - Model '$MODEL' is installed (ollama pull $MODEL)"
+    else
+        echo "  - Model '$MODEL' is available on the server"
+    fi
     echo "  - Model name is correct"
     exit 1
 fi
 
-echo "✅ Connection successful, model responding"
+echo "✅ Connection successful, model responding on $PLATFORM"
 echo ""
 
 # Function to run a single request (internal use)
@@ -82,27 +120,43 @@ run_single_request() {
     # Escape the prompt for JSON
     local escaped_prompt=$(echo "$prompt" | jq -R -s '.')
     
-    # Prepare request payload using jq to ensure proper JSON formatting
-    request_payload=$(jq -n \
-        --arg model "$MODEL" \
-        --argjson prompt "$escaped_prompt" \
-        --arg temp "$temp" \
-        --arg predict "$actual_predict_tokens" \
-        --arg context "$actual_context_size" \
-        '{
-            model: $model,
-            prompt: $prompt,
-            stream: false,
-            options: {
-                num_predict: ($predict | tonumber),
+    # Prepare request payload based on platform
+    if [ "$PLATFORM" = "ollama" ]; then
+        request_payload=$(jq -n \
+            --arg model "$MODEL" \
+            --argjson prompt "$escaped_prompt" \
+            --arg temp "$temp" \
+            --arg predict "$actual_predict_tokens" \
+            --arg context "$actual_context_size" \
+            '{
+                model: $model,
+                prompt: $prompt,
+                stream: false,
+                options: {
+                    num_predict: ($predict | tonumber),
+                    temperature: ($temp | tonumber),
+                    top_p: 0.9,
+                    top_k: 40,
+                    num_ctx: ($context | tonumber),
+                    stop: ["<|thinking|>"],
+                    repeat_penalty: 1.1
+                }
+            }')
+    else
+        request_payload=$(jq -n \
+            --arg model "$MODEL" \
+            --argjson prompt "$escaped_prompt" \
+            --arg temp "$temp" \
+            --arg max_tokens "$actual_predict_tokens" \
+            '{
+                model: $model,
+                messages: [{"role": "user", "content": $prompt}],
                 temperature: ($temp | tonumber),
                 top_p: 0.9,
-                top_k: 40,
-                num_ctx: ($context | tonumber),
-                stop: ["<|thinking|>"],
-                repeat_penalty: 1.1
-            }
-        }')
+                max_tokens: ($max_tokens | tonumber),
+                stream: false
+            }')
+    fi
     
     if [ "$is_warmup" != "true" ] && ([ "$DEBUG" = "true" ] || [ "$VERBOSE" = "true" ]); then
         echo "    📤 Request payload:" >&2
@@ -113,7 +167,7 @@ run_single_request() {
     # Make request and measure time
     start_time=$(date +%s.%N)
     
-    response=$(curl -s --max-time $REQUEST_TIMEOUT -w "%{http_code}" http://$HOST/api/generate \
+    response=$(curl -s --max-time $REQUEST_TIMEOUT -w "%{http_code}" http://$ENDPOINT$API_PATH \
         -H "Content-Type: application/json" \
         -d "$request_payload")
     
@@ -144,13 +198,20 @@ run_single_request() {
         return 1
     fi
     
-    response_text=$(echo "$response_body" | jq -r '.response // empty')
-    thinking_text=$(echo "$response_body" | jq -r '.thinking // empty')
+    # Extract response text based on platform
+    if [ "$PLATFORM" = "ollama" ]; then
+        response_text=$(echo "$response_body" | jq -r '.response // empty')
+        thinking_text=$(echo "$response_body" | jq -r '.thinking // empty')
+        content_source="response"
+    else
+        # OpenAI/vLLM format
+        response_text=$(echo "$response_body" | jq -r '.choices[0].message.content // .choices[0].text // empty')
+        content_source="choices"
+    fi
     
-    # Only accept proper response content, reject thinking-only responses
-    content_source="response"
+    # Only accept proper response content
     if [ -z "$response_text" ] || [ "$response_text" = "null" ] || [ "$response_text" = "empty" ]; then
-        echo "error:No_Response:Model_returned_only_thinking_or_empty_response"
+        echo "error:No_Response:Model_returned_empty_response"
         return 1
     fi
     
@@ -188,33 +249,54 @@ get_response_text() {
     # Escape the prompt for JSON
     local escaped_prompt=$(echo "$prompt" | jq -R -s '.')
     
-    # Prepare request payload using jq to ensure proper JSON formatting
-    request_payload=$(jq -n \
-        --arg model "$MODEL" \
-        --argjson prompt "$escaped_prompt" \
-        --arg temp "$temp" \
-        --arg predict "$actual_predict_tokens" \
-        --arg context "$actual_context_size" \
-        '{
-            model: $model,
-            prompt: $prompt,
-            stream: false,
-            options: {
-                num_predict: ($predict | tonumber),
+    # Prepare request payload based on platform
+    if [ "$PLATFORM" = "ollama" ]; then
+        request_payload=$(jq -n \
+            --arg model "$MODEL" \
+            --argjson prompt "$escaped_prompt" \
+            --arg temp "$temp" \
+            --arg predict "$actual_predict_tokens" \
+            --arg context "$actual_context_size" \
+            '{
+                model: $model,
+                prompt: $prompt,
+                stream: false,
+                options: {
+                    num_predict: ($predict | tonumber),
+                    temperature: ($temp | tonumber),
+                    top_p: 0.9,
+                    top_k: 40,
+                    num_ctx: ($context | tonumber),
+                    stop: ["<|thinking|>"],
+                    repeat_penalty: 1.1
+                }
+            }')
+    else
+        request_payload=$(jq -n \
+            --arg model "$MODEL" \
+            --argjson prompt "$escaped_prompt" \
+            --arg temp "$temp" \
+            --arg max_tokens "$actual_predict_tokens" \
+            '{
+                model: $model,
+                messages: [{"role": "user", "content": $prompt}],
                 temperature: ($temp | tonumber),
                 top_p: 0.9,
-                top_k: 40,
-                num_ctx: ($context | tonumber),
-                stop: ["<|thinking|>"],
-                repeat_penalty: 1.1
-            }
-        }')
+                max_tokens: ($max_tokens | tonumber),
+                stream: false
+            }')
+    fi
     
-    response=$(curl -s --max-time $REQUEST_TIMEOUT http://$HOST/api/generate \
+    response=$(curl -s --max-time $REQUEST_TIMEOUT http://$ENDPOINT$API_PATH \
         -H "Content-Type: application/json" \
         -d "$request_payload")
     
-    response_text=$(echo "$response" | jq -r '.response // empty')
+    # Extract response text based on platform
+    if [ "$PLATFORM" = "ollama" ]; then
+        response_text=$(echo "$response" | jq -r '.response // empty')
+    else
+        response_text=$(echo "$response" | jq -r '.choices[0].message.content // .choices[0].text // empty')
+    fi
     
     # Only return actual response content, not thinking
     if [ ! -z "$response_text" ] && [ "$response_text" != "null" ] && [ "$response_text" != "empty" ]; then
@@ -454,12 +536,13 @@ echo ""
 echo "Completed: $(date)"
 
 # Save results to file
-results_file="quick_max_tokens_$(date +%Y%m%d_%H%M%S).txt"
+results_file="quick_max_tokens_${PLATFORM}_$(date +%Y%m%d_%H%M%S).txt"
 {
     echo "Maximum Tokens/Second Test Results"
     echo "================================="
+    echo "Platform: ${PLATFORM^^}"
     echo "Model: $MODEL"
-    echo "Host: $HOST"
+    echo "Host: $ENDPOINT"
     echo "Test Date: $(date)"
     echo ""
     echo "Maximum tokens/second: $MAX_TOKENS_PER_SECOND"

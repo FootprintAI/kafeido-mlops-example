@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Maximum Tokens/Second Benchmark for GPT-OSS 20B
+Maximum Tokens/Second Benchmark for Multiple LLM Platforms
 This script finds the peak performance (tokens/second) the model can achieve
+Supports: Ollama, vLLM/OpenAI-compatible APIs
 """
 
 import requests
@@ -9,50 +10,64 @@ import time
 import json
 import statistics
 import threading
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import psutil
 import sys
 
 class MaxTokensBenchmark:
-    def __init__(self, host="localhost", port=11434, model="gpt-oss:20b"):
+    def __init__(self, host="localhost", port=11434, model="gpt-oss:20b", platform="ollama"):
+        self.host = host
+        self.port = port
         self.base_url = f"http://{host}:{port}"
         self.model = model
+        self.platform = platform.lower()
         self.max_tokens_per_second = 0
         self.best_config = {}
         
+        # Validate platform
+        if self.platform not in ["ollama", "openai", "vllm"]:
+            raise ValueError(f"Unsupported platform: {platform}. Supported: ollama, openai, vllm")
+        
+        # Set API endpoints based on platform
+        if self.platform == "ollama":
+            self.generate_url = f"{self.base_url}/api/generate"
+            self.models_url = f"{self.base_url}/api/tags"
+        else:  # openai/vllm
+            self.generate_url = f"{self.base_url}/v1/chat/completions"
+            self.models_url = f"{self.base_url}/v1/models"
+        
     def generate_long_content_request(self, prompt, max_tokens=None, temperature=0.7):
         """Make a request optimized for maximum token generation"""
-        url = f"{self.base_url}/api/generate"
-        
-        options = {
-            "temperature": temperature,
-            "top_p": 0.9,
-            "top_k": 40,
-        }
-        
-        if max_tokens:
-            options["num_predict"] = max_tokens
-            
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": options
-        }
-        
         start_time = time.time()
         
         try:
-            response = requests.post(url, json=payload, timeout=300)
+            if self.platform == "ollama":
+                payload = self._build_ollama_payload(prompt, max_tokens, temperature)
+            else:  # openai/vllm
+                payload = self._build_openai_payload(prompt, max_tokens, temperature)
+            
+            response = requests.post(self.generate_url, json=payload, timeout=300)
             response.raise_for_status()
             
             end_time = time.time()
             result = response.json()
             
+            # Extract response text based on platform
+            if self.platform == "ollama":
+                response_text = result.get('response', '')
+            else:  # openai/vllm
+                if 'choices' in result and len(result['choices']) > 0:
+                    choice = result['choices'][0]
+                    if 'message' in choice:
+                        response_text = choice['message'].get('content', '')
+                    else:
+                        response_text = choice.get('text', '')
+                else:
+                    response_text = ''
+            
             # Calculate metrics
             latency = end_time - start_time
-            response_text = result.get('response', '')
             tokens_generated = len(response_text.split())
             char_count = len(response_text)
             tokens_per_second = tokens_generated / latency if latency > 0 else 0
@@ -67,15 +82,50 @@ class MaxTokensBenchmark:
                 'response_text': response_text,
                 'temperature': temperature,
                 'max_tokens': max_tokens,
-                'prompt_length': len(prompt.split())
+                'prompt_length': len(prompt.split()),
+                'platform': self.platform
             }
             
         except Exception as e:
             return {
                 'success': False,
                 'error': str(e),
-                'latency': time.time() - start_time
+                'latency': time.time() - start_time,
+                'platform': self.platform
             }
+    
+    def _build_ollama_payload(self, prompt, max_tokens, temperature):
+        """Build payload for Ollama API"""
+        options = {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "top_k": 40,
+        }
+        
+        if max_tokens:
+            options["num_predict"] = max_tokens
+            
+        return {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": options
+        }
+    
+    def _build_openai_payload(self, prompt, max_tokens, temperature):
+        """Build payload for OpenAI-compatible API"""
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "top_p": 0.9,
+            "stream": False
+        }
+        
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+            
+        return payload
     
     def test_optimal_prompt_length(self):
         """Find the optimal prompt length for maximum token generation"""
@@ -292,11 +342,11 @@ class MaxTokensBenchmark:
         try:
             test_result = self.generate_long_content_request("Test", max_tokens=10)
             if not test_result['success']:
-                print(f"❌ Model {self.model} not available: {test_result.get('error')}")
+                print(f"❌ Model {self.model} not available on {self.platform}: {test_result.get('error')}")
                 return None
-            print(f"✅ Model {self.model} is available and responding")
+            print(f"✅ Model {self.model} is available and responding on {self.platform}")
         except Exception as e:
-            print(f"❌ Connection failed: {e}")
+            print(f"❌ Connection failed to {self.platform} at {self.base_url}: {e}")
             return None
         
         print()
@@ -345,18 +395,36 @@ class MaxTokensBenchmark:
         }
 
 def main():
-    # Configuration
-    HOST = "localhost"
-    PORT = 11434
-    MODEL = "gpt-oss:20b"
+    parser = argparse.ArgumentParser(description='Maximum Tokens/Second Benchmark for Multiple LLM Platforms')
+    parser.add_argument('--platform', '-p', choices=['ollama', 'openai', 'vllm'], default='ollama',
+                       help='Platform to benchmark (default: ollama)')
+    parser.add_argument('--host', default='localhost',
+                       help='Host address (default: localhost)')
+    parser.add_argument('--port', type=int,
+                       help='Port number (default: 11434 for ollama, 8000 for openai/vllm)')
+    parser.add_argument('--model', '-m',
+                       help='Model name (default: gpt-oss:20b for ollama, gpt-3.5-turbo for openai/vllm)')
+    
+    args = parser.parse_args()
+    
+    # Set defaults based on platform
+    if args.port is None:
+        args.port = 11434 if args.platform == 'ollama' else 8000
+    
+    if args.model is None:
+        if args.platform == 'ollama':
+            args.model = 'gpt-oss:20b'
+        else:
+            args.model = 'gpt-3.5-turbo'  # Default for OpenAI-compatible
     
     print(f"Maximum Tokens/Second Benchmark")
-    print(f"Model: {MODEL}")
-    print(f"Endpoint: {HOST}:{PORT}")
+    print(f"Platform: {args.platform.upper()}")
+    print(f"Model: {args.model}")
+    print(f"Endpoint: {args.host}:{args.port}")
     print()
     
     # Initialize benchmark
-    benchmark = MaxTokensBenchmark(HOST, PORT, MODEL)
+    benchmark = MaxTokensBenchmark(args.host, args.port, args.model, args.platform)
     
     # Run benchmark
     results = benchmark.run_maximum_performance_benchmark()
@@ -364,7 +432,13 @@ def main():
     if results:
         # Save results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"max_tokens_benchmark_{timestamp}.json"
+        platform_name = args.platform
+        filename = f"max_tokens_benchmark_{platform_name}_{timestamp}.json"
+        
+        # Add platform info to results
+        results['platform'] = args.platform
+        results['host'] = args.host
+        results['port'] = args.port
         
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2, default=str)
@@ -374,7 +448,7 @@ def main():
         # Quick summary
         print(f"\n📋 QUICK SUMMARY:")
         print(f"🎯 Maximum tokens/second: {results['max_tokens_per_second']:.2f}")
-        print(f"🏆 This is the peak performance for {MODEL}")
+        print(f"🏆 This is the peak performance for {args.model} on {args.platform.upper()}")
 
 if __name__ == "__main__":
     main()
