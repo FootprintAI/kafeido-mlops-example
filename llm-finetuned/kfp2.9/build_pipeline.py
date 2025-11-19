@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""
+Build script for KFP v2.9 LLM Fine-tuning Pipeline
+
+This script:
+1. Reads trainop.ipynb
+2. Generates a complete pipeline.py with trainOp embedded
+3. Compiles it to YAML
+
+This way, users can edit trainop.ipynb separately, and the build process
+handles the embedding automatically.
+"""
+
+import os
+import sys
+
+def load_trainop_source():
+    """Load trainop source code from notebook, extracting only the trainOp function."""
+    import json
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    notebook_path = os.path.join(current_dir, 'trainop.ipynb')
+
+    # Check if notebook exists, otherwise fall back to trainop.py
+    if os.path.exists(notebook_path):
+        with open(notebook_path, 'r') as f:
+            notebook = json.load(f)
+
+        # Extract only the cells we need: imports and trainop-function
+        source_lines = []
+        for cell in notebook['cells']:
+            cell_id = cell.get('id', '')
+            # Only include the imports and trainop-function cells
+            if cell_id in ['imports', 'trainop-function']:
+                if cell['cell_type'] == 'code':
+                    source = cell.get('source', [])
+                    if isinstance(source, list):
+                        source_lines.extend(source)
+                    else:
+                        source_lines.append(source)
+                    source_lines.append('\n')  # Add newline between cells
+
+        return ''.join(source_lines)
+    else:
+        # Fall back to trainop.py if it exists
+        trainop_path = os.path.join(current_dir, 'trainop.py')
+        if not os.path.exists(trainop_path):
+            raise FileNotFoundError(
+                f"Neither {notebook_path} nor {trainop_path} found. "
+                "Please ensure trainop.ipynb exists."
+            )
+
+        with open(trainop_path, 'r') as f:
+            content = f.read()
+
+        # Filter out any get_ipython() calls that might have been exported
+        lines = content.split('\n')
+        filtered_lines = [line for line in lines if 'get_ipython()' not in line]
+        return '\n'.join(filtered_lines)
+
+
+def extract_trainop_params(trainop_source):
+    """Extract trainOp function parameters using AST parsing."""
+    import ast
+
+    tree = ast.parse(trainop_source)
+
+    # Find trainOp function
+    trainop_func = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == 'trainOp':
+            trainop_func = node
+            break
+
+    if not trainop_func:
+        raise ValueError("Could not find trainOp function")
+
+    params = []
+    args = trainop_func.args
+
+    # Get defaults
+    defaults = args.defaults
+    num_defaults = len(defaults)
+    num_args = len(args.args)
+
+    for i, arg in enumerate(args.args):
+        param = {'name': arg.arg}
+
+        # Get type annotation
+        if arg.annotation:
+            param['type'] = ast.unparse(arg.annotation)
+        else:
+            param['type'] = 'str'  # default type
+
+        # Get default value
+        default_idx = i - (num_args - num_defaults)
+        if default_idx >= 0:
+            param['default'] = ast.unparse(defaults[default_idx])
+
+        params.append(param)
+
+    return params
+
+
+def generate_pipeline_with_embedded_trainop():
+    """Generate pipeline_kfp29.py with trainOp embedded."""
+
+    # Load trainop source
+    trainop_source = load_trainop_source()
+
+    # Extract just the trainOp function (from 'def trainOp' onwards)
+    lines = trainop_source.split('\n')
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith('def trainOp('):
+            start_idx = i
+            break
+
+    if start_idx is None:
+        raise ValueError("Could not find trainOp function in trainop.ipynb")
+
+    trainop_function = '\n'.join(lines[start_idx:])
+
+    # Extract parameters from trainOp using AST
+    params = extract_trainop_params(trainop_function)
+
+    # Filter out internal parameters (not exposed to pipeline)
+    # kfp_output_path is handled by KFP's Output[Model] artifact
+    pipeline_params = [p for p in params if p['name'] not in ['kfp_output_path']]
+
+    # Generate pipeline function signature
+    pipeline_sig = ',\n    '.join([
+        f"{p['name']}: {p['type']}" + (f" = {p['default']}" if 'default' in p else '')
+        for p in pipeline_params
+    ])
+
+    # Generate component call arguments
+    component_args = ',\n        '.join([f"{p['name']}={p['name']}" for p in pipeline_params])
+
+    # Indent the trainOp function to fit inside the component
+    indented_trainop = '\n'.join('    ' + line if line.strip() else ''
+                                   for line in trainop_function.split('\n'))
+
+    # Generate the complete pipeline code
+    pipeline_code = f'''"""
+KFP v2.9 LLM Fine-tuning Pipeline - Auto-generated with embedded trainOp
+
+DO NOT EDIT THIS FILE DIRECTLY!
+Edit trainop.ipynb instead, then run: python build_pipeline.py
+"""
+
+from typing import List, Dict, Any
+import os
+
+from kfp import dsl
+from kfp import compiler
+
+try:
+    from kfp import kubernetes
+except ImportError:
+    raise ImportError(
+        "kfp-kubernetes is required but not installed. "
+        "Install it with: pip install kfp-kubernetes"
+    )
+
+# Environment variables
+pvcname = os.environ.get('TINTIN_SESSION_TEMPLATE_PVC_NAME')
+generated_pipeline_filename = os.environ.get('TINTIN_SESSION_TEMPLATE_GENERATED_PIPELINE_FILENAME', 'pipeline.yaml')
+gpu_type_list_text = os.environ.get('TINTIN_SESSION_TEMPLATE_GPU_TYPE_LIST')
+gpu_limit = os.environ.get('TINTIN_SESSION_TEMPLATE_GPU_LIMIT', '1')  # Default to 1 GPU for LLM training
+
+# GPU Image Selection
+# Use Vertex AI's official GPU image by default (has NVIDIA drivers + CUDA pre-installed)
+# Set TINTIN_SESSION_TEMPLATE_USE_CUSTOM_IMAGE=true to use custom image instead
+use_custom_image = os.environ.get('TINTIN_SESSION_TEMPLATE_USE_CUSTOM_IMAGE', 'false').lower() == 'true'
+custom_image = os.environ.get('TINTIN_SESSION_TEMPLATE_DEFAULT_IMAGE', 'asia-east1-docker.pkg.dev/footprintai-prod/kafeido-mlops/jupyter-pytorch-full-kfpv2:nv22.12')
+
+# GPU Training Images:
+# Use PyTorch official image to avoid torch_xla conflicts
+vertex_ai_gpu_image = 'pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime'
+# Alternative options:
+# vertex_ai_gpu_image = 'asia-east1-docker.pkg.dev/footprintai-prod/kafeido-mlops/deeplearning-platform-release/pytorch-gpu.2-0'  # Google DL Container (has torch_xla)
+# vertex_ai_gpu_image = 'gcr.io/deeplearning-platform-release/pytorch-gpu.2-0:latest'  # Original Google image
+
+if use_custom_image:
+    default_image = custom_image
+    print(f"Using custom image: {{custom_image}}")
+else:
+    default_image = vertex_ai_gpu_image
+    print(f"Using Vertex AI GPU image: {{vertex_ai_gpu_image}}")
+
+mountPath = os.environ.get('TINTIN_SESSION_TEMPLATE_MOUNT_PATH', '/home/jovyan')
+project_id = os.environ.get('TINTIN_SESSION_TEMPLATE_PROJECT_ID')
+minio_endpoint = os.environ.get('TINTIN_SESSION_TEMPLATE_MINIO_ENDPOINT')
+minio_access_key = os.environ.get('TINTIN_SESSION_TEMPLATE_MINIO_ACCESS_KEY')
+minio_secret_key = os.environ.get('TINTIN_SESSION_TEMPLATE_MINIO_SECRET_KEY')
+minio_bucket = os.environ.get('TINTIN_SESSION_TEMPLATE_MINIO_BUCKET')
+
+# Write to current directory (this file will be in outputs/ already)
+generated_pipeline_filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(generated_pipeline_filename))
+
+
+@dsl.component(
+    base_image=default_image,
+    # By default uses: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
+    # This is PyTorch's official image with:
+    #   - NVIDIA drivers and CUDA 11.7
+    #   - PyTorch 2.0.1 with GPU support
+    #   - cuDNN 8 for deep learning
+    #   - NO torch_xla (avoids compatibility issues for GPU-only training)
+    #
+    # To use a different custom image instead, set at build time:
+    #   export TINTIN_SESSION_TEMPLATE_USE_CUSTOM_IMAGE=true
+    #   export TINTIN_SESSION_TEMPLATE_DEFAULT_IMAGE=your-custom-image:tag
+    #   python3 build_pipeline.py
+    packages_to_install=[
+        "kfp==2.9.0",
+        # Use compatible versions for LLM fine-tuning
+        # NOTE: transformers >= 4.44.0 required for full Llama 3.1 support (rope_scaling fix)
+        "transformers==4.44.0",
+        "datasets==2.18.0",
+        "peft==0.12.0",
+        "bitsandbytes==0.43.0",
+        "accelerate==0.33.0",
+        "scipy>=1.11.0",
+        "tintin-sdk>=0.0.4",
+        "google-cloud-storage>=2.10.0",
+        # Required dependencies
+        "sentencepiece>=0.1.99",
+        "protobuf>=3.20.0",
+        "safetensors>=0.4.0",
+    ]
+)
+def train_component(
+    output_model: dsl.Output[dsl.Model],
+    {pipeline_sig}
+):
+    """LLM Fine-tuning component with embedded trainOp from trainop.ipynb"""
+    from typing import List, Dict, Any
+
+    # trainOp function embedded from trainop.ipynb
+{indented_trainop}
+
+    # Call trainOp with KFP output path for automatic GCS upload
+    trainOp(
+        {component_args},
+        kfp_output_path=output_model.path
+    )
+
+
+@dsl.pipeline(
+    name='Llama 3.1 Fine-tuning Pipeline',
+    description='Fine-tune Llama 3.1 model with LoRA or full fine-tuning'
+)
+def templated_pipeline_func(
+    {pipeline_sig}
+):
+    """KFP v2.9 Pipeline Definition for LLM Fine-tuning"""
+
+    train_task = train_component(
+        {component_args}
+    )
+
+    # Use parameters directly for annotations - convert to string
+    kubernetes.add_pod_annotation(train_task, annotation_key='tintin.footprint-ai.com/session-model-relative-path', annotation_value=str(model_relative_path))
+    kubernetes.add_pod_annotation(train_task, annotation_key='tintin.footprint-ai.com/session-model-name', annotation_value=str(model_name))
+
+    kubernetes.set_image_pull_secrets(train_task, secret_names=['registry-secret'])
+
+    # LLM fine-tuning requires more resources
+    train_task.set_cpu_request('4')
+    train_task.set_cpu_limit('8')
+    train_task.set_memory_request('32Gi')
+    train_task.set_memory_limit('64Gi')
+
+    # Request GPU for LLM training (essential for bf16/fp16)
+    #
+    # WHY GPU LIMIT IS NEEDED:
+    # 1. Performance: LLM training on CPU is 100x+ slower (hours → days)
+    # 2. Precision: fp16/bf16 requires GPU, fp32 on CPU has poor convergence for LLMs
+    # 3. Memory: GPU has high-bandwidth memory needed for large model parameters
+    # 4. Cost: GPU training is faster = cheaper than long-running CPU jobs
+    #
+    # WHEN TO CONFIGURE:
+    # - Default (1 GPU): Good for 7B-13B models with LoRA fine-tuning
+    # - 0 GPUs: Only for testing/debugging (very slow, use fp32 precision)
+    # - 2+ GPUs: For larger models (30B+) or full fine-tuning (non-LoRA)
+    #
+    # HOW TO CONFIGURE AT BUILD TIME:
+    #   export TINTIN_SESSION_TEMPLATE_GPU_LIMIT=0  # CPU-only
+    #   export TINTIN_SESSION_TEMPLATE_GPU_LIMIT=2  # 2 GPUs
+    #   python3 build_pipeline.py
+    #
+    # NOTE: GPU config is baked into the compiled YAML at build time.
+    # To change GPU settings at runtime, you must rebuild the pipeline.
+    # This is a Kubernetes limitation - GPU requests must be in the pod spec.
+    #
+    if gpu_limit and int(gpu_limit) > 0:
+        train_task.set_gpu_limit(gpu_limit)
+
+    kubernetes.use_field_path_as_env(
+        train_task,
+        env_name='NVIDIA_VISIBLE_DEVICES',
+        field_path='metadata.annotations.nvidia.com/gpu-devices'
+    )
+
+    # Add GPU toleration and node selector if GPU type is specified
+    if gpu_type_list_text:
+        gpu_types = [g.strip() for g in gpu_type_list_text.split(',')]
+        kubernetes.add_node_selector(
+            train_task,
+            label_key='cloud.google.com/gke-accelerator',
+            label_value=gpu_types[0]  # Use first GPU type
+        )
+        kubernetes.add_toleration(
+            train_task,
+            key='nvidia.com/gpu',
+            operator='Equal',
+            value='present',
+            effect='NoSchedule'
+        )
+
+
+if __name__ == '__main__':
+    compiler.Compiler().compile(
+        pipeline_func=templated_pipeline_func,
+        package_path=generated_pipeline_filename
+    )
+    print(f"Pipeline compiled successfully to {{generated_pipeline_filename}}")
+'''
+
+    return pipeline_code
+
+
+def main():
+    """Main build script."""
+    print("Building KFP v2.9 LLM Fine-tuning Pipeline...")
+    print("1. Loading trainop.ipynb...")
+
+    try:
+        # Create outputs directory
+        base_dir = os.path.dirname(__file__)
+        output_dir = os.path.join(base_dir, 'outputs')
+        os.makedirs(output_dir, exist_ok=True)
+
+        pipeline_code = generate_pipeline_with_embedded_trainop()
+
+        print("2. Generating pipeline_kfp29_generated.py...")
+        output_file = os.path.join(output_dir, 'pipeline_kfp29_generated.py')
+        with open(output_file, 'w') as f:
+            f.write(pipeline_code)
+
+        print(f"3. Pipeline code written to {output_file}")
+        print("4. Compiling pipeline to YAML...")
+
+        # Run the generated pipeline file to compile it
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, output_file],
+            capture_output=True,
+            text=True
+        )
+
+        # Print the compilation output
+        if result.stdout:
+            print(result.stdout)
+
+        if result.stderr:
+            print("STDERR:", result.stderr)
+
+        if result.returncode != 0:
+            print(f"✗ Pipeline compilation failed with exit code {result.returncode}")
+            sys.exit(1)
+
+        print("✓ Build complete!")
+        print(f"✓ Generated file: outputs/pipeline_kfp29_generated.py")
+        print(f"✓ Compiled YAML: outputs/{os.environ.get('TINTIN_SESSION_TEMPLATE_GENERATED_PIPELINE_FILENAME', 'pipeline.yaml')}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Build failed: {e}")
+        print("STDOUT:", e.stdout)
+        print("STDERR:", e.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"✗ Build failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
