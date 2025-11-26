@@ -124,7 +124,7 @@ class OpenAIChatAdapter(APIAdapter):
 
 class MaxTokensBenchmark:
     def __init__(self, host="localhost", port=11434, model="gpt-oss:20b",
-                 api_type=APIType.OLLAMA):
+                 api_type=APIType.OLLAMA, verbose=False):
         """
         Initialize benchmark with configurable API type
 
@@ -133,12 +133,14 @@ class MaxTokensBenchmark:
             port: API port
             model: Model name/identifier
             api_type: APIType enum (OLLAMA, OPENAI, or OPENAI_CHAT)
+            verbose: Enable verbose debug output
         """
         self.base_url = f"http://{host}:{port}"
         self.model = model
         self.max_tokens_per_second = 0
         self.best_config = {}
         self.api_type = api_type
+        self.verbose = verbose
 
         # Select appropriate adapter
         if api_type == APIType.OLLAMA:
@@ -151,6 +153,7 @@ class MaxTokensBenchmark:
             raise ValueError(f"Unsupported API type: {api_type}")
 
         print(f"Using {api_type.value} API format")
+        print(f"Endpoint: {self.adapter.get_endpoint(self.base_url)}")
 
     def generate_long_content_request(self, prompt, max_tokens=None, temperature=0.7):
         """Make a request optimized for maximum token generation"""
@@ -165,6 +168,10 @@ class MaxTokensBenchmark:
             top_k=40
         )
 
+        if self.verbose:
+            print(f"\n📤 Request to: {url}")
+            print(f"📤 Payload: {json.dumps(payload, indent=2)[:500]}")
+
         start_time = time.time()
 
         try:
@@ -172,11 +179,36 @@ class MaxTokensBenchmark:
             response.raise_for_status()
 
             end_time = time.time()
-            result = response.json()
+
+            # Debug: Print raw response for troubleshooting
+            raw_text = response.text
+
+            if self.verbose:
+                print(f"📥 Response status: {response.status_code}")
+                print(f"📥 Response (first 500 chars): {raw_text[:500]}")
+
+            # Try to parse JSON - handle streaming responses
+            try:
+                result = response.json()
+            except json.JSONDecodeError as json_err:
+                # If JSON parsing fails, show the raw response for debugging
+                return {
+                    'success': False,
+                    'error': f'JSON decode error: {json_err}. Raw response (first 500 chars): {raw_text[:500]}',
+                    'latency': time.time() - start_time
+                }
 
             # Calculate metrics
             latency = end_time - start_time
             response_text = self.adapter.extract_response(result)
+
+            if not response_text:
+                return {
+                    'success': False,
+                    'error': f'Empty response from API. Full response: {json.dumps(result, indent=2)[:500]}',
+                    'latency': latency
+                }
+
             tokens_generated = len(response_text.split())
             char_count = len(response_text)
             tokens_per_second = tokens_generated / latency if latency > 0 else 0
@@ -194,10 +226,16 @@ class MaxTokensBenchmark:
                 'prompt_length': len(prompt.split())
             }
 
+        except requests.exceptions.RequestException as e:
+            return {
+                'success': False,
+                'error': f'Request error: {str(e)}',
+                'latency': time.time() - start_time
+            }
         except Exception as e:
             return {
                 'success': False,
-                'error': str(e),
+                'error': f'Unexpected error: {str(e)}',
                 'latency': time.time() - start_time
             }
     
@@ -485,6 +523,7 @@ def main():
     parser.add_argument('--host', type=str, default='localhost', help='API host')
     parser.add_argument('--port', type=int, default=11434, help='API port')
     parser.add_argument('--model', type=str, default='gpt-oss:20b', help='Model name')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
 
     args = parser.parse_args()
 
@@ -503,7 +542,7 @@ def main():
     print()
 
     # Initialize benchmark
-    benchmark = MaxTokensBenchmark(args.host, args.port, args.model, api_type)
+    benchmark = MaxTokensBenchmark(args.host, args.port, args.model, api_type, verbose=args.verbose)
 
     # Run benchmark
     results = benchmark.run_maximum_performance_benchmark()
