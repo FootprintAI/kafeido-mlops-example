@@ -91,13 +91,24 @@ class OpenAIAdapter(APIAdapter):
     def extract_response(self, response_json):
         """
         Extract response from standard OpenAI format.
-        Supports: choices[0].message.content
+        Supports:
+        - choices[0].message.content (standard)
+        - choices[0].message.reasoning_content (for reasoning models)
         """
         choices = response_json.get('choices', [])
         if choices:
             message = choices[0].get('message', {})
+
+            # Try content first (standard field)
             content = message.get('content', '')
-            return content
+            if content:
+                return content
+
+            # Fallback to reasoning_content (for models with reasoning)
+            reasoning_content = message.get('reasoning_content', '')
+            if reasoning_content:
+                return reasoning_content
+
         return ''
 
 class MaxTokensBenchmark:
