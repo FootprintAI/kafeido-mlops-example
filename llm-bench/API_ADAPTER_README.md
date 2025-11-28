@@ -1,6 +1,6 @@
 # LLM Benchmark API Adapter
 
-This benchmark tool now supports multiple API formats through an adapter pattern, making it compatible with both Ollama and OpenAI-style APIs.
+This benchmark tool supports two API formats through an adapter pattern, making it compatible with both Ollama and standard OpenAI-style APIs.
 
 ## Supported API Formats
 
@@ -8,37 +8,36 @@ This benchmark tool now supports multiple API formats through an adapter pattern
 - **Endpoint**: `/api/generate`
 - **Format**: Ollama-specific JSON format
 - **Use case**: Testing Ollama-hosted models
+- **Request**: Uses `prompt` and nested `options` object
+- **Response**: Returns `response` field
 
-### 2. OpenAI Completions API
-- **Endpoint**: `/v1/completions`
-- **Format**: OpenAI completions format (text completion)
-- **Use case**: Testing vLLM, FastChat, or other OpenAI-compatible servers
-
-### 3. OpenAI Chat API
+### 2. OpenAI Chat Completions API
 - **Endpoint**: `/v1/chat/completions`
-- **Format**: OpenAI chat format (message-based)
-- **Use case**: Testing chat models on OpenAI-compatible servers
+- **Format**: Standard OpenAI chat completions format (message-based)
+- **Use case**: Testing vLLM, FastChat, or other OpenAI-compatible servers
+- **Request**: Uses `messages` array with role/content
+- **Response**: Returns `choices[0].message.content`
 
 ## Usage Examples
 
 ### Test Ollama API (Default)
 ```bash
 python llm-bench.py
-# OR
+# OR explicitly specify
 python llm-bench.py --api-type ollama --host localhost --port 11434 --model gpt-oss:20b
 ```
 
-### Test OpenAI Completions API
+### Test OpenAI Compatible API
 ```bash
-python llm-bench.py --api-type openai --host localhost --port 8000 --model gpt-oss-20b
+python llm-bench.py --api-type openai --host localhost --port 8080 --model gpt-oss:20b
 ```
 
-### Test OpenAI Chat API
+### Test with Verbose Output
 ```bash
-python llm-bench.py --api-type openai_chat --host localhost --port 8000 --model gpt-oss-20b
+python llm-bench.py --api-type openai --port 8080 --model gpt-oss:20b --verbose
 ```
 
-### Test Remote vLLM Server
+### Test Remote Server
 ```bash
 python llm-bench.py --api-type openai --host api.example.com --port 443 --model meta-llama/Llama-2-7b-hf
 ```
@@ -47,10 +46,11 @@ python llm-bench.py --api-type openai --host api.example.com --port 443 --model 
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--api-type` | string | `ollama` | API format: `ollama`, `openai`, or `openai_chat` |
+| `--api-type` | string | `ollama` | API format: `ollama` or `openai` |
 | `--host` | string | `localhost` | API server hostname |
-| `--port` | int | `11434` | API server port |
+| `--port` | int | `11434` | API server port (11434 for Ollama, 8080 for custom) |
 | `--model` | string | `gpt-oss:20b` | Model name/identifier |
+| `--verbose`, `-v` | flag | `false` | Enable verbose debug output |
 
 ## API Request Format Examples
 
@@ -69,22 +69,10 @@ python llm-bench.py --api-type openai --host api.example.com --port 443 --model 
 }
 ```
 
-### OpenAI Completions Format
+### OpenAI Chat Completions Format
 ```json
 {
-  "model": "gpt-oss-20b",
-  "prompt": "Write about AI...",
-  "max_tokens": 500,
-  "temperature": 0.7,
-  "top_p": 0.9,
-  "stream": false
-}
-```
-
-### OpenAI Chat Format
-```json
-{
-  "model": "gpt-oss-20b",
+  "model": "gpt-oss:20b",
   "messages": [
     {"role": "user", "content": "Write about AI..."}
   ],
@@ -92,6 +80,31 @@ python llm-bench.py --api-type openai --host api.example.com --port 443 --model 
   "temperature": 0.7,
   "top_p": 0.9,
   "stream": false
+}
+```
+
+**Expected Response:**
+```json
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion",
+  "created": 1699564939,
+  "model": "gpt-oss:20b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "AI stands for Artificial Intelligence..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 50,
+    "total_tokens": 60
+  }
 }
 ```
 
@@ -104,15 +117,16 @@ MaxTokensBenchmark
     |
     +-- APIAdapter (abstract)
             |
-            +-- OllamaAdapter
-            +-- OpenAIAdapter
-            +-- OpenAIChatAdapter
+            +-- OllamaAdapter (/api/generate)
+            +-- OpenAIAdapter (/v1/chat/completions)
 ```
 
 Each adapter implements:
 - `build_request()`: Creates API-specific request payload
 - `get_endpoint()`: Returns the correct endpoint path
 - `extract_response()`: Parses API-specific response format
+
+This design keeps the benchmark logic unified while supporting different API protocols.
 
 ## Adding New API Formats
 

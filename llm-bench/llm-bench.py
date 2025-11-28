@@ -20,8 +20,7 @@ from enum import Enum
 class APIType(Enum):
     """Supported API types"""
     OLLAMA = "ollama"
-    OPENAI = "openai"
-    OPENAI_CHAT = "openai_chat"  # For /v1/chat/completions
+    OPENAI = "openai"  # Standard OpenAI format (chat completions)
 
 class APIAdapter(ABC):
     """Abstract base class for API adapters"""
@@ -68,33 +67,7 @@ class OllamaAdapter(APIAdapter):
         return response_json.get('response', '')
 
 class OpenAIAdapter(APIAdapter):
-    """Adapter for OpenAI Completions API format (/v1/completions)"""
-
-    def build_request(self, model, prompt, max_tokens, temperature, top_p, top_k):
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "temperature": temperature,
-            "top_p": top_p,
-        }
-
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-
-        return payload
-
-    def get_endpoint(self, base_url):
-        return f"{base_url}/v1/completions"
-
-    def extract_response(self, response_json):
-        choices = response_json.get('choices', [])
-        if choices:
-            return choices[0].get('text', '')
-        return ''
-
-class OpenAIChatAdapter(APIAdapter):
-    """Adapter for OpenAI Chat API format (/v1/chat/completions)"""
+    """Adapter for standard OpenAI Chat Completions API format (/v1/chat/completions)"""
 
     def build_request(self, model, prompt, max_tokens, temperature, top_p, top_k):
         payload = {
@@ -116,10 +89,15 @@ class OpenAIChatAdapter(APIAdapter):
         return f"{base_url}/v1/chat/completions"
 
     def extract_response(self, response_json):
+        """
+        Extract response from standard OpenAI format.
+        Supports: choices[0].message.content
+        """
         choices = response_json.get('choices', [])
         if choices:
             message = choices[0].get('message', {})
-            return message.get('content', '')
+            content = message.get('content', '')
+            return content
         return ''
 
 class MaxTokensBenchmark:
@@ -147,8 +125,6 @@ class MaxTokensBenchmark:
             self.adapter = OllamaAdapter()
         elif api_type == APIType.OPENAI:
             self.adapter = OpenAIAdapter()
-        elif api_type == APIType.OPENAI_CHAT:
-            self.adapter = OpenAIChatAdapter()
         else:
             raise ValueError(f"Unsupported API type: {api_type}")
 
@@ -187,11 +163,10 @@ class MaxTokensBenchmark:
                 print(f"📥 Response status: {response.status_code}")
                 print(f"📥 Response (first 500 chars): {raw_text[:500]}")
 
-            # Try to parse JSON - handle streaming responses
+            # Try to parse JSON
             try:
                 result = response.json()
             except json.JSONDecodeError as json_err:
-                # If JSON parsing fails, show the raw response for debugging
                 return {
                     'success': False,
                     'error': f'JSON decode error: {json_err}. Raw response (first 500 chars): {raw_text[:500]}',
@@ -516,12 +491,12 @@ def main():
     parser.add_argument(
         '--api-type',
         type=str,
-        choices=['ollama', 'openai', 'openai_chat'],
+        choices=['ollama', 'openai'],
         default='ollama',
-        help='API format to use (default: ollama)'
+        help='API format to use: "ollama" for Ollama API, "openai" for standard OpenAI /v1/chat/completions (default: ollama)'
     )
     parser.add_argument('--host', type=str, default='localhost', help='API host')
-    parser.add_argument('--port', type=int, default=11434, help='API port')
+    parser.add_argument('--port', type=int, default=11434, help='API port (11434 for Ollama, 8080 for custom servers)')
     parser.add_argument('--model', type=str, default='gpt-oss:20b', help='Model name')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
 
@@ -530,8 +505,7 @@ def main():
     # Convert string to APIType enum
     api_type_map = {
         'ollama': APIType.OLLAMA,
-        'openai': APIType.OPENAI,
-        'openai_chat': APIType.OPENAI_CHAT
+        'openai': APIType.OPENAI
     }
     api_type = api_type_map[args.api_type]
 
