@@ -2,6 +2,7 @@
 """
 Maximum Tokens/Second Benchmark for GPT-OSS 20B
 This script finds the peak performance (tokens/second) the model can achieve
+Supports both Ollama and OpenAI API formats
 """
 
 import requests
@@ -13,50 +14,191 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import psutil
 import sys
+from abc import ABC, abstractmethod
+from enum import Enum
 
-class MaxTokensBenchmark:
-    def __init__(self, host="localhost", port=11434, model="gpt-oss:20b"):
-        self.base_url = f"http://{host}:{port}"
-        self.model = model
-        self.max_tokens_per_second = 0
-        self.best_config = {}
-        
-    def generate_long_content_request(self, prompt, max_tokens=None, temperature=0.7):
-        """Make a request optimized for maximum token generation"""
-        url = f"{self.base_url}/api/generate"
-        
+class APIType(Enum):
+    """Supported API types"""
+    OLLAMA = "ollama"
+    OPENAI = "openai"  # Standard OpenAI format (chat completions)
+
+class APIAdapter(ABC):
+    """Abstract base class for API adapters"""
+
+    @abstractmethod
+    def build_request(self, model, prompt, max_tokens, temperature, top_p, top_k):
+        """Build the request payload for the specific API"""
+        pass
+
+    @abstractmethod
+    def get_endpoint(self, base_url):
+        """Get the API endpoint"""
+        pass
+
+    @abstractmethod
+    def extract_response(self, response_json):
+        """Extract the generated text from the response"""
+        pass
+
+class OllamaAdapter(APIAdapter):
+    """Adapter for Ollama API format"""
+
+    def build_request(self, model, prompt, max_tokens, temperature, top_p, top_k):
         options = {
             "temperature": temperature,
-            "top_p": 0.9,
-            "top_k": 40,
+            "top_p": top_p,
+            "top_k": top_k,
         }
-        
+
         if max_tokens:
             options["num_predict"] = max_tokens
-            
-        payload = {
-            "model": self.model,
+
+        return {
+            "model": model,
             "prompt": prompt,
             "stream": False,
             "options": options
         }
-        
+
+    def get_endpoint(self, base_url):
+        return f"{base_url}/api/generate"
+
+    def extract_response(self, response_json):
+        return response_json.get('response', '')
+
+class OpenAIAdapter(APIAdapter):
+    """Adapter for standard OpenAI Chat Completions API format (/v1/chat/completions)"""
+
+    def build_request(self, model, prompt, max_tokens, temperature, top_p, top_k):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "stream": False,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+
+        return payload
+
+    def get_endpoint(self, base_url):
+        return f"{base_url}/v1/chat/completions"
+
+    def extract_response(self, response_json):
+        """
+        Extract response from standard OpenAI format.
+        Supports:
+        - choices[0].message.content (standard)
+        - choices[0].message.reasoning_content (for reasoning models)
+        """
+        choices = response_json.get('choices', [])
+        if choices:
+            message = choices[0].get('message', {})
+
+            # Try content first (standard field)
+            content = message.get('content', '')
+            if content:
+                return content
+
+            # Fallback to reasoning_content (for models with reasoning)
+            reasoning_content = message.get('reasoning_content', '')
+            if reasoning_content:
+                return reasoning_content
+
+        return ''
+
+class MaxTokensBenchmark:
+    def __init__(self, host="localhost", port=11434, model="gpt-oss:20b",
+                 api_type=APIType.OLLAMA, verbose=False):
+        """
+        Initialize benchmark with configurable API type
+
+        Args:
+            host: API host
+            port: API port
+            model: Model name/identifier
+            api_type: APIType enum (OLLAMA, OPENAI, or OPENAI_CHAT)
+            verbose: Enable verbose debug output
+        """
+        self.base_url = f"http://{host}:{port}"
+        self.model = model
+        self.max_tokens_per_second = 0
+        self.best_config = {}
+        self.api_type = api_type
+        self.verbose = verbose
+
+        # Select appropriate adapter
+        if api_type == APIType.OLLAMA:
+            self.adapter = OllamaAdapter()
+        elif api_type == APIType.OPENAI:
+            self.adapter = OpenAIAdapter()
+        else:
+            raise ValueError(f"Unsupported API type: {api_type}")
+
+        print(f"Using {api_type.value} API format")
+        print(f"Endpoint: {self.adapter.get_endpoint(self.base_url)}")
+
+    def generate_long_content_request(self, prompt, max_tokens=None, temperature=0.7):
+        """Make a request optimized for maximum token generation"""
+        url = self.adapter.get_endpoint(self.base_url)
+
+        payload = self.adapter.build_request(
+            model=self.model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=0.9,
+            top_k=40
+        )
+
+        if self.verbose:
+            print(f"\n📤 Request to: {url}")
+            print(f"📤 Payload: {json.dumps(payload, indent=2)[:500]}")
+
         start_time = time.time()
-        
+
         try:
             response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
-            
+
             end_time = time.time()
-            result = response.json()
-            
+
+            # Debug: Print raw response for troubleshooting
+            raw_text = response.text
+
+            if self.verbose:
+                print(f"📥 Response status: {response.status_code}")
+                print(f"📥 Response (first 500 chars): {raw_text[:500]}")
+
+            # Try to parse JSON
+            try:
+                result = response.json()
+            except json.JSONDecodeError as json_err:
+                return {
+                    'success': False,
+                    'error': f'JSON decode error: {json_err}. Raw response (first 500 chars): {raw_text[:500]}',
+                    'latency': time.time() - start_time
+                }
+
             # Calculate metrics
             latency = end_time - start_time
-            response_text = result.get('response', '')
+            response_text = self.adapter.extract_response(result)
+
+            if not response_text:
+                return {
+                    'success': False,
+                    'error': f'Empty response from API. Full response: {json.dumps(result, indent=2)[:500]}',
+                    'latency': latency
+                }
+
             tokens_generated = len(response_text.split())
             char_count = len(response_text)
             tokens_per_second = tokens_generated / latency if latency > 0 else 0
-            
+
             return {
                 'success': True,
                 'latency': latency,
@@ -69,11 +211,17 @@ class MaxTokensBenchmark:
                 'max_tokens': max_tokens,
                 'prompt_length': len(prompt.split())
             }
-            
+
+        except requests.exceptions.RequestException as e:
+            return {
+                'success': False,
+                'error': f'Request error: {str(e)}',
+                'latency': time.time() - start_time
+            }
         except Exception as e:
             return {
                 'success': False,
-                'error': str(e),
+                'error': f'Unexpected error: {str(e)}',
                 'latency': time.time() - start_time
             }
     
@@ -345,36 +493,59 @@ class MaxTokensBenchmark:
         }
 
 def main():
-    # Configuration
-    HOST = "localhost"
-    PORT = 11434
-    MODEL = "gpt-oss:20b"
-    
+    import argparse
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Maximum Tokens/Second Benchmark - Supports Ollama and OpenAI API formats'
+    )
+    parser.add_argument(
+        '--api-type',
+        type=str,
+        choices=['ollama', 'openai'],
+        default='ollama',
+        help='API format to use: "ollama" for Ollama API, "openai" for standard OpenAI /v1/chat/completions (default: ollama)'
+    )
+    parser.add_argument('--host', type=str, default='localhost', help='API host')
+    parser.add_argument('--port', type=int, default=11434, help='API port (11434 for Ollama, 8080 for custom servers)')
+    parser.add_argument('--model', type=str, default='gpt-oss:20b', help='Model name')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
+
+    args = parser.parse_args()
+
+    # Convert string to APIType enum
+    api_type_map = {
+        'ollama': APIType.OLLAMA,
+        'openai': APIType.OPENAI
+    }
+    api_type = api_type_map[args.api_type]
+
     print(f"Maximum Tokens/Second Benchmark")
-    print(f"Model: {MODEL}")
-    print(f"Endpoint: {HOST}:{PORT}")
+    print(f"API Type: {args.api_type}")
+    print(f"Model: {args.model}")
+    print(f"Endpoint: {args.host}:{args.port}")
     print()
-    
+
     # Initialize benchmark
-    benchmark = MaxTokensBenchmark(HOST, PORT, MODEL)
-    
+    benchmark = MaxTokensBenchmark(args.host, args.port, args.model, api_type, verbose=args.verbose)
+
     # Run benchmark
     results = benchmark.run_maximum_performance_benchmark()
-    
+
     if results:
         # Save results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"max_tokens_benchmark_{timestamp}.json"
-        
+        filename = f"max_tokens_benchmark_{args.api_type}_{timestamp}.json"
+
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2, default=str)
-        
+
         print(f"\n💾 Results saved to: {filename}")
-        
+
         # Quick summary
         print(f"\n📋 QUICK SUMMARY:")
         print(f"🎯 Maximum tokens/second: {results['max_tokens_per_second']:.2f}")
-        print(f"🏆 This is the peak performance for {MODEL}")
+        print(f"🏆 This is the peak performance for {args.model}")
 
 if __name__ == "__main__":
     main()
