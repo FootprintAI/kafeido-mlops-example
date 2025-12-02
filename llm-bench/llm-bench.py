@@ -641,10 +641,11 @@ class MaxTokensBenchmark:
         if self.best_throughput_config:
             print("\n🚀 System Throughput Performance:")
             best = self.best_throughput_config
-            print(f"  Maximum throughput: {best['throughput']:.2f} tokens/s")
+            print(f"  Maximum throughput: {best['mean_throughput']:.2f} ± {best['stddev_throughput']:.2f} tokens/s")
             print(f"  Optimal concurrency: {best['concurrency']}")
-            print(f"  Avg request latency: {best['avg_latency']:.2f}s")
-            print(f"  Success rate: {best['successful']}/{best['concurrency']}")
+            print(f"  Coefficient of Variation: {best['cv_throughput']:.1f}% ({'Stable' if best['cv_throughput'] < 10 else 'Variable'})")
+            print(f"  Latency p50/p95/p99: {best['p50_latency']:.2f}s / {best['p95_latency']:.2f}s / {best['p99_latency']:.2f}s")
+            print(f"  Success rate: {best['success_rate']:.1f}%")
 
         if 'result' in self.best_config:
             result = self.best_config['result']
