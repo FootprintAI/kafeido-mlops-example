@@ -113,7 +113,7 @@ class OpenAIAdapter(APIAdapter):
 
 class MaxTokensBenchmark:
     def __init__(self, host="localhost", port=11434, model="gpt-oss:20b",
-                 api_type=APIType.OLLAMA, verbose=False):
+                 api_type=APIType.OLLAMA, verbose=False, max_concurrency=32):
         """
         Initialize benchmark with configurable API type
 
@@ -121,8 +121,9 @@ class MaxTokensBenchmark:
             host: API host
             port: API port
             model: Model name/identifier
-            api_type: APIType enum (OLLAMA, OPENAI, or OPENAI_CHAT)
+            api_type: APIType enum (OLLAMA or OPENAI)
             verbose: Enable verbose debug output
+            max_concurrency: Maximum concurrency level to test
         """
         self.base_url = f"http://{host}:{port}"
         self.model = model
@@ -130,6 +131,11 @@ class MaxTokensBenchmark:
         self.best_config = {}
         self.api_type = api_type
         self.verbose = verbose
+        self.max_concurrency = max_concurrency
+
+        # Track throughput metrics
+        self.max_throughput = 0
+        self.best_throughput_config = {}
 
         # Select appropriate adapter
         if api_type == APIType.OLLAMA:
@@ -385,48 +391,119 @@ class MaxTokensBenchmark:
         return results
     
     def concurrent_generation_test(self):
-        """Test if concurrent requests can increase overall throughput"""
-        print("⚡ Testing concurrent generation (may reduce individual speed but increase total throughput)...")
-        
+        """Test concurrent requests to measure system throughput"""
+        print("=" * 70)
+        print("⚡ CONCURRENT THROUGHPUT BENCHMARK")
+        print("=" * 70)
+        print(f"Testing concurrency levels from 1 to {self.max_concurrency}")
+        print("Goal: Find optimal concurrency for maximum system throughput")
+        print()
+
         prompt = "Write a detailed explanation about cloud computing, including IaaS, PaaS, SaaS, benefits, challenges, and future trends."
-        
+
         def single_request():
             return self.generate_long_content_request(prompt, max_tokens=300, temperature=0.7)
-        
-        # Test different concurrency levels
-        concurrency_levels = [1, 2, 3]
-        
+
+        # Generate concurrency levels: 1, 2, 4, 8, 16, 32, ... up to max_concurrency
+        concurrency_levels = []
+        level = 1
+        while level <= self.max_concurrency:
+            concurrency_levels.append(level)
+            if level == 1:
+                level = 2
+            elif level == 2:
+                level = 4
+            else:
+                level *= 2
+
+        # If max_concurrency is not a power of 2, add it
+        if concurrency_levels[-1] != self.max_concurrency:
+            concurrency_levels.append(self.max_concurrency)
+
+        results_summary = []
+
         for concurrency in concurrency_levels:
-            print(f"  Testing {concurrency} concurrent requests...")
-            
+            print(f"📊 Testing {concurrency} concurrent request(s)...")
+
             start_time = time.time()
-            
+
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [executor.submit(single_request) for _ in range(concurrency)]
                 results = [future.result() for future in as_completed(futures)]
-            
+
             total_time = time.time() - start_time
             successful = [r for r in results if r['success']]
-            
+            failed_count = len(results) - len(successful)
+
             if successful:
                 total_tokens = sum(r['tokens_generated'] for r in successful)
-                overall_tokens_per_second = total_tokens / total_time
+                overall_throughput = total_tokens / total_time  # System throughput
                 avg_individual_tokens_per_second = statistics.mean([r['tokens_per_second'] for r in successful])
-                
-                print(f"    Total tokens: {total_tokens}")
-                print(f"    Total time: {total_time:.2f}s") 
-                print(f"    Overall tokens/s: {overall_tokens_per_second:.2f}")
-                print(f"    Avg individual tokens/s: {avg_individual_tokens_per_second:.2f}")
-                
-                # For concurrent tests, we care about individual speed
+                avg_latency = statistics.mean([r['latency'] for r in successful])
+                min_latency = min([r['latency'] for r in successful])
+                max_latency = max([r['latency'] for r in successful])
+
+                result_data = {
+                    'concurrency': concurrency,
+                    'successful': len(successful),
+                    'failed': failed_count,
+                    'total_tokens': total_tokens,
+                    'total_time': total_time,
+                    'throughput': overall_throughput,
+                    'avg_tokens_per_sec': avg_individual_tokens_per_second,
+                    'avg_latency': avg_latency,
+                    'min_latency': min_latency,
+                    'max_latency': max_latency
+                }
+                results_summary.append(result_data)
+
+                print(f"  ✅ Success: {len(successful)}/{concurrency} requests")
+                if failed_count > 0:
+                    print(f"  ❌ Failed: {failed_count}")
+                print(f"  📈 System Throughput: {overall_throughput:.2f} tokens/s")
+                print(f"  ⚡ Avg Request Speed: {avg_individual_tokens_per_second:.2f} tokens/s")
+                print(f"  ⏱️  Latency: avg={avg_latency:.2f}s, min={min_latency:.2f}s, max={max_latency:.2f}s")
+                print()
+
+                # Track maximum throughput
+                if overall_throughput > self.max_throughput:
+                    self.max_throughput = overall_throughput
+                    self.best_throughput_config = result_data
+
+                # Also track if individual speed is best
                 if avg_individual_tokens_per_second > self.max_tokens_per_second:
                     self.max_tokens_per_second = avg_individual_tokens_per_second
                     self.best_config = {
                         'type': 'concurrent_test',
                         'concurrency': concurrency,
                         'individual_tokens_per_second': avg_individual_tokens_per_second,
-                        'overall_tokens_per_second': overall_tokens_per_second
+                        'overall_tokens_per_second': overall_throughput
                     }
+            else:
+                print(f"  ❌ All {concurrency} requests failed")
+                print()
+
+        # Print summary
+        if results_summary:
+            print("=" * 70)
+            print("📊 THROUGHPUT SUMMARY")
+            print("=" * 70)
+            print(f"{'Concurrency':<12} {'Throughput':<15} {'Avg Latency':<15} {'Success Rate':<15}")
+            print("-" * 70)
+            for result in results_summary:
+                success_rate = f"{result['successful']}/{result['concurrency']}"
+                print(f"{result['concurrency']:<12} {result['throughput']:<15.2f} {result['avg_latency']:<15.2f} {success_rate:<15}")
+
+            print()
+            print("🏆 BEST THROUGHPUT:")
+            best = self.best_throughput_config
+            print(f"  Concurrency: {best['concurrency']}")
+            print(f"  System Throughput: {best['throughput']:.2f} tokens/s")
+            print(f"  Avg Request Latency: {best['avg_latency']:.2f}s")
+            print(f"  Success Rate: {best['successful']}/{best['concurrency']}")
+            print()
+
+        return results_summary
     
     def run_maximum_performance_benchmark(self):
         """Run comprehensive benchmark to find maximum tokens/second"""
@@ -469,26 +546,34 @@ class MaxTokensBenchmark:
         print("=" * 70)
         print("🏆 MAXIMUM PERFORMANCE RESULTS")
         print("=" * 70)
-        print(f"Maximum tokens/second achieved: {self.max_tokens_per_second:.2f}")
-        print()
-        print("Best configuration:")
-        for key, value in self.best_config.items():
-            if key != 'result':
-                print(f"  {key}: {value}")
-        
+
+        print("\n📊 Single Request Performance:")
+        print(f"  Maximum tokens/second: {self.max_tokens_per_second:.2f}")
+        print(f"  Best configuration: {self.best_config.get('type', 'N/A')}")
+
+        if self.best_throughput_config:
+            print("\n🚀 System Throughput Performance:")
+            best = self.best_throughput_config
+            print(f"  Maximum throughput: {best['throughput']:.2f} tokens/s")
+            print(f"  Optimal concurrency: {best['concurrency']}")
+            print(f"  Avg request latency: {best['avg_latency']:.2f}s")
+            print(f"  Success rate: {best['successful']}/{best['concurrency']}")
+
         if 'result' in self.best_config:
             result = self.best_config['result']
-            print(f"\nBest run details:")
+            print(f"\n📝 Best Single Request Details:")
             print(f"  Latency: {result['latency']:.2f}s")
             print(f"  Tokens generated: {result['tokens_generated']}")
             print(f"  Characters generated: {result['char_count']}")
             print(f"  Characters/second: {result['chars_per_second']:.0f}")
-        
+
         print(f"\nBenchmark completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        
+
         return {
             'max_tokens_per_second': self.max_tokens_per_second,
+            'max_throughput': self.max_throughput,
             'best_config': self.best_config,
+            'best_throughput_config': self.best_throughput_config,
             'model': self.model
         }
 
@@ -510,6 +595,7 @@ def main():
     parser.add_argument('--port', type=int, default=11434, help='API port (11434 for Ollama, 8080 for custom servers)')
     parser.add_argument('--model', type=str, default='gpt-oss:20b', help='Model name')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
+    parser.add_argument('--max-concurrency', type=int, default=32, help='Maximum concurrency level to test (default: 32)')
 
     args = parser.parse_args()
 
@@ -524,10 +610,18 @@ def main():
     print(f"API Type: {args.api_type}")
     print(f"Model: {args.model}")
     print(f"Endpoint: {args.host}:{args.port}")
+    print(f"Max Concurrency: {args.max_concurrency}")
     print()
 
     # Initialize benchmark
-    benchmark = MaxTokensBenchmark(args.host, args.port, args.model, api_type, verbose=args.verbose)
+    benchmark = MaxTokensBenchmark(
+        args.host,
+        args.port,
+        args.model,
+        api_type,
+        verbose=args.verbose,
+        max_concurrency=args.max_concurrency
+    )
 
     # Run benchmark
     results = benchmark.run_maximum_performance_benchmark()
