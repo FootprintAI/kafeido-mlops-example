@@ -113,7 +113,8 @@ class OpenAIAdapter(APIAdapter):
 
 class MaxTokensBenchmark:
     def __init__(self, host="localhost", port=11434, model="gpt-oss:20b",
-                 api_type=APIType.OLLAMA, verbose=False, max_concurrency=32):
+                 api_type=APIType.OLLAMA, verbose=False, max_concurrency=32,
+                 iterations=3, warmup_requests=3):
         """
         Initialize benchmark with configurable API type
 
@@ -124,6 +125,8 @@ class MaxTokensBenchmark:
             api_type: APIType enum (OLLAMA or OPENAI)
             verbose: Enable verbose debug output
             max_concurrency: Maximum concurrency level to test
+            iterations: Number of iterations per concurrency level
+            warmup_requests: Number of warmup requests before benchmark
         """
         self.base_url = f"http://{host}:{port}"
         self.model = model
@@ -132,6 +135,8 @@ class MaxTokensBenchmark:
         self.api_type = api_type
         self.verbose = verbose
         self.max_concurrency = max_concurrency
+        self.iterations = iterations
+        self.warmup_requests = warmup_requests
 
         # Track throughput metrics
         self.max_throughput = 0
@@ -390,12 +395,38 @@ class MaxTokensBenchmark:
         
         return results
     
+    def warmup(self):
+        """Warmup phase to eliminate cold start effects"""
+        if self.warmup_requests <= 0:
+            return
+
+        print("=" * 70)
+        print("🔥 WARMUP PHASE")
+        print("=" * 70)
+        print(f"Running {self.warmup_requests} warmup request(s) to initialize system...")
+        print()
+
+        warmup_prompt = "Warmup request to initialize GPU and model cache."
+
+        for i in range(self.warmup_requests):
+            print(f"  Warmup {i+1}/{self.warmup_requests}...", end=" ")
+            result = self.generate_long_content_request(warmup_prompt, max_tokens=100, temperature=0.7)
+            if result['success']:
+                print(f"✅ ({result['latency']:.2f}s)")
+            else:
+                print(f"❌ ({result.get('error', 'Unknown error')})")
+
+        print()
+        print("✅ Warmup complete - system ready for benchmarking")
+        print()
+
     def concurrent_generation_test(self):
-        """Test concurrent requests to measure system throughput"""
+        """Test concurrent requests to measure system throughput with statistical analysis"""
         print("=" * 70)
         print("⚡ CONCURRENT THROUGHPUT BENCHMARK")
         print("=" * 70)
         print(f"Testing concurrency levels from 1 to {self.max_concurrency}")
+        print(f"Iterations per level: {self.iterations}")
         print("Goal: Find optimal concurrency for maximum system throughput")
         print()
 
@@ -423,84 +454,137 @@ class MaxTokensBenchmark:
         results_summary = []
 
         for concurrency in concurrency_levels:
-            print(f"📊 Testing {concurrency} concurrent request(s)...")
+            print(f"📊 Testing {concurrency} concurrent request(s) - {self.iterations} iterations...")
 
-            start_time = time.time()
+            # Run multiple iterations
+            iteration_results = []
 
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [executor.submit(single_request) for _ in range(concurrency)]
-                results = [future.result() for future in as_completed(futures)]
+            for iteration in range(self.iterations):
+                if self.verbose:
+                    print(f"  Iteration {iteration+1}/{self.iterations}...")
 
-            total_time = time.time() - start_time
-            successful = [r for r in results if r['success']]
-            failed_count = len(results) - len(successful)
+                start_time = time.time()
 
-            if successful:
-                total_tokens = sum(r['tokens_generated'] for r in successful)
-                overall_throughput = total_tokens / total_time  # System throughput
-                avg_individual_tokens_per_second = statistics.mean([r['tokens_per_second'] for r in successful])
-                avg_latency = statistics.mean([r['latency'] for r in successful])
-                min_latency = min([r['latency'] for r in successful])
-                max_latency = max([r['latency'] for r in successful])
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = [executor.submit(single_request) for _ in range(concurrency)]
+                    results = [future.result() for future in as_completed(futures)]
+
+                total_time = time.time() - start_time
+                successful = [r for r in results if r['success']]
+                failed_count = len(results) - len(successful)
+
+                if successful:
+                    total_tokens = sum(r['tokens_generated'] for r in successful)
+                    overall_throughput = total_tokens / total_time
+                    avg_latency = statistics.mean([r['latency'] for r in successful])
+
+                    iteration_results.append({
+                        'throughput': overall_throughput,
+                        'latency': avg_latency,
+                        'successful': len(successful),
+                        'failed': failed_count,
+                        'latencies': [r['latency'] for r in successful]
+                    })
+
+            # Calculate statistics across iterations
+            if iteration_results:
+                throughputs = [r['throughput'] for r in iteration_results]
+                latencies = [r['latency'] for r in iteration_results]
+                all_latencies = []
+                for r in iteration_results:
+                    all_latencies.extend(r['latencies'])
+
+                # Calculate percentiles
+                all_latencies_sorted = sorted(all_latencies)
+                p50 = all_latencies_sorted[len(all_latencies_sorted) // 2] if all_latencies_sorted else 0
+                p95_idx = int(len(all_latencies_sorted) * 0.95)
+                p95 = all_latencies_sorted[p95_idx] if p95_idx < len(all_latencies_sorted) else 0
+                p99_idx = int(len(all_latencies_sorted) * 0.99)
+                p99 = all_latencies_sorted[p99_idx] if p99_idx < len(all_latencies_sorted) else 0
+
+                # Mean and standard deviation
+                mean_throughput = statistics.mean(throughputs)
+                stddev_throughput = statistics.stdev(throughputs) if len(throughputs) > 1 else 0
+                mean_latency = statistics.mean(latencies)
+                stddev_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
+
+                # Coefficient of variation (stability measure)
+                cv_throughput = (stddev_throughput / mean_throughput * 100) if mean_throughput > 0 else 0
+
+                # Success rate
+                total_successful = sum(r['successful'] for r in iteration_results)
+                total_failed = sum(r['failed'] for r in iteration_results)
+                total_requests = total_successful + total_failed
+                success_rate_pct = (total_successful / total_requests * 100) if total_requests > 0 else 0
 
                 result_data = {
                     'concurrency': concurrency,
-                    'successful': len(successful),
-                    'failed': failed_count,
-                    'total_tokens': total_tokens,
-                    'total_time': total_time,
-                    'throughput': overall_throughput,
-                    'avg_tokens_per_sec': avg_individual_tokens_per_second,
-                    'avg_latency': avg_latency,
-                    'min_latency': min_latency,
-                    'max_latency': max_latency
+                    'iterations': self.iterations,
+                    'mean_throughput': mean_throughput,
+                    'stddev_throughput': stddev_throughput,
+                    'cv_throughput': cv_throughput,
+                    'mean_latency': mean_latency,
+                    'stddev_latency': stddev_latency,
+                    'p50_latency': p50,
+                    'p95_latency': p95,
+                    'p99_latency': p99,
+                    'min_throughput': min(throughputs),
+                    'max_throughput': max(throughputs),
+                    'success_rate': success_rate_pct,
+                    'successful': total_successful,
+                    'failed': total_failed
                 }
                 results_summary.append(result_data)
 
-                print(f"  ✅ Success: {len(successful)}/{concurrency} requests")
-                if failed_count > 0:
-                    print(f"  ❌ Failed: {failed_count}")
-                print(f"  📈 System Throughput: {overall_throughput:.2f} tokens/s")
-                print(f"  ⚡ Avg Request Speed: {avg_individual_tokens_per_second:.2f} tokens/s")
-                print(f"  ⏱️  Latency: avg={avg_latency:.2f}s, min={min_latency:.2f}s, max={max_latency:.2f}s")
+                # Print results
+                print(f"  ✅ Success Rate: {success_rate_pct:.1f}% ({total_successful}/{total_requests})")
+                if total_failed > 0:
+                    print(f"  ❌ Failed: {total_failed}")
+                print(f"  📈 Throughput: {mean_throughput:.2f} ± {stddev_throughput:.2f} tokens/s (CV={cv_throughput:.1f}%)")
+                print(f"  ⏱️  Latency: p50={p50:.2f}s, p95={p95:.2f}s, p99={p99:.2f}s")
+                print(f"  📊 Stability: {'Excellent' if cv_throughput < 5 else 'Good' if cv_throughput < 10 else 'Fair' if cv_throughput < 20 else 'Poor'}")
                 print()
 
-                # Track maximum throughput
-                if overall_throughput > self.max_throughput:
-                    self.max_throughput = overall_throughput
+                # Track maximum throughput (using mean)
+                if mean_throughput > self.max_throughput:
+                    self.max_throughput = mean_throughput
                     self.best_throughput_config = result_data
 
                 # Also track if individual speed is best
-                if avg_individual_tokens_per_second > self.max_tokens_per_second:
-                    self.max_tokens_per_second = avg_individual_tokens_per_second
+                if mean_throughput > self.max_tokens_per_second:
+                    self.max_tokens_per_second = mean_throughput
                     self.best_config = {
                         'type': 'concurrent_test',
                         'concurrency': concurrency,
-                        'individual_tokens_per_second': avg_individual_tokens_per_second,
-                        'overall_tokens_per_second': overall_throughput
+                        'individual_tokens_per_second': mean_throughput,
+                        'overall_tokens_per_second': mean_throughput
                     }
             else:
-                print(f"  ❌ All {concurrency} requests failed")
+                print(f"  ❌ All iterations failed")
                 print()
 
         # Print summary
         if results_summary:
             print("=" * 70)
-            print("📊 THROUGHPUT SUMMARY")
+            print("📊 THROUGHPUT SUMMARY (Statistical Analysis)")
             print("=" * 70)
-            print(f"{'Concurrency':<12} {'Throughput':<15} {'Avg Latency':<15} {'Success Rate':<15}")
+            print(f"{'Concur':<8} {'Throughput (±σ)':<25} {'Latency p50/p95/p99':<30} {'Stability':<12}")
             print("-" * 70)
             for result in results_summary:
-                success_rate = f"{result['successful']}/{result['concurrency']}"
-                print(f"{result['concurrency']:<12} {result['throughput']:<15.2f} {result['avg_latency']:<15.2f} {success_rate:<15}")
+                throughput_str = f"{result['mean_throughput']:.1f} ± {result['stddev_throughput']:.1f}"
+                latency_str = f"{result['p50_latency']:.1f}/{result['p95_latency']:.1f}/{result['p99_latency']:.1f}s"
+                cv = result['cv_throughput']
+                stability = 'Excellent' if cv < 5 else 'Good' if cv < 10 else 'Fair' if cv < 20 else 'Poor'
+                print(f"{result['concurrency']:<8} {throughput_str:<25} {latency_str:<30} {stability:<12}")
 
             print()
-            print("🏆 BEST THROUGHPUT:")
+            print("🏆 BEST THROUGHPUT (Mean across iterations):")
             best = self.best_throughput_config
-            print(f"  Concurrency: {best['concurrency']}")
-            print(f"  System Throughput: {best['throughput']:.2f} tokens/s")
-            print(f"  Avg Request Latency: {best['avg_latency']:.2f}s")
-            print(f"  Success Rate: {best['successful']}/{best['concurrency']}")
+            print(f"  Concurrency Level: {best['concurrency']}")
+            print(f"  Mean Throughput: {best['mean_throughput']:.2f} ± {best['stddev_throughput']:.2f} tokens/s")
+            print(f"  Coefficient of Variation: {best['cv_throughput']:.1f}% ({'Stable' if best['cv_throughput'] < 10 else 'Variable'})")
+            print(f"  Latency Percentiles: p50={best['p50_latency']:.2f}s, p95={best['p95_latency']:.2f}s, p99={best['p99_latency']:.2f}s")
+            print(f"  Success Rate: {best['success_rate']:.1f}%")
             print()
 
         return results_summary
@@ -525,20 +609,23 @@ class MaxTokensBenchmark:
             return None
         
         print()
-        
+
+        # Warmup phase
+        self.warmup()
+
         # Run all tests
         self.test_optimal_prompt_length()
         print()
-        
+
         self.test_different_max_tokens()
         print()
-        
+
         self.test_temperature_settings()
         print()
-        
+
         self.stress_test_maximum_output()
         print()
-        
+
         self.concurrent_generation_test()
         print()
         
@@ -554,10 +641,11 @@ class MaxTokensBenchmark:
         if self.best_throughput_config:
             print("\n🚀 System Throughput Performance:")
             best = self.best_throughput_config
-            print(f"  Maximum throughput: {best['throughput']:.2f} tokens/s")
+            print(f"  Maximum throughput: {best['mean_throughput']:.2f} ± {best['stddev_throughput']:.2f} tokens/s")
             print(f"  Optimal concurrency: {best['concurrency']}")
-            print(f"  Avg request latency: {best['avg_latency']:.2f}s")
-            print(f"  Success rate: {best['successful']}/{best['concurrency']}")
+            print(f"  Coefficient of Variation: {best['cv_throughput']:.1f}% ({'Stable' if best['cv_throughput'] < 10 else 'Variable'})")
+            print(f"  Latency p50/p95/p99: {best['p50_latency']:.2f}s / {best['p95_latency']:.2f}s / {best['p99_latency']:.2f}s")
+            print(f"  Success rate: {best['success_rate']:.1f}%")
 
         if 'result' in self.best_config:
             result = self.best_config['result']
@@ -596,6 +684,8 @@ def main():
     parser.add_argument('--model', type=str, default='gpt-oss:20b', help='Model name')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output')
     parser.add_argument('--max-concurrency', type=int, default=32, help='Maximum concurrency level to test (default: 32)')
+    parser.add_argument('--iterations', type=int, default=3, help='Number of iterations per concurrency level (default: 3)')
+    parser.add_argument('--warmup', type=int, default=3, help='Number of warmup requests (default: 3, set to 0 to disable)')
 
     args = parser.parse_args()
 
@@ -611,6 +701,8 @@ def main():
     print(f"Model: {args.model}")
     print(f"Endpoint: {args.host}:{args.port}")
     print(f"Max Concurrency: {args.max_concurrency}")
+    print(f"Iterations: {args.iterations}")
+    print(f"Warmup Requests: {args.warmup}")
     print()
 
     # Initialize benchmark
@@ -620,7 +712,9 @@ def main():
         args.model,
         api_type,
         verbose=args.verbose,
-        max_concurrency=args.max_concurrency
+        max_concurrency=args.max_concurrency,
+        iterations=args.iterations,
+        warmup_requests=args.warmup
     )
 
     # Run benchmark
